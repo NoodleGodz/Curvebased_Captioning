@@ -1,3 +1,32 @@
-%pip install torch transformers pandas numpy pillow tqdm --quiet
-pip install torch torch-geometric open3d numpy scipy pandas trimesh
-    pip install transformers torch pandas pillow qwen-vl-utils
+# Core
+torch>=2.0
+numpy
+scipy
+pandas
+pillow
+
+# LLM / fine-tuning (Qwen2.5-VL needs transformers >= 4.49)
+transformers>=4.49
+peft
+accelerate
+bitsandbytes
+safetensors
+qwen-vl-utils
+
+# Geometry / rendering
+open3d
+trimesh
+pyrender
+
+# Config files (for the optional --config loader)
+pyyaml
+
+# Logging (optional)
+wandb
+
+# Notebooks (evaluation/ and tools/verify_captions/)
+jupyter
+matplotlib
+
+# Optional, faster LLM attention (needs a CUDA toolchain):
+#   pip install flash-attn --no-build-isolation
