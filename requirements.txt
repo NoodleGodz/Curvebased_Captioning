@@ -1,0 +1,3 @@
+%pip install torch transformers pandas numpy pillow tqdm --quiet
+pip install torch torch-geometric open3d numpy scipy pandas trimesh
+    pip install transformers torch pandas pillow qwen-vl-utils

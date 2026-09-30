@@ -1,0 +1,5 @@
+checkpoints/
+data/renders/
+*.pt
+__pycache__/
+wandb/
