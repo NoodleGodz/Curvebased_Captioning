@@ -1,0 +1,125 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Fracture captioning run config — single source of truth for (from the repo root)
+#   python tools/cache_data/cache_dataset.py --config configs/mae_v3.yml
+#   python tools/cache_data/check_cache.py   --config configs/mae_v3.yml
+#   python scripts/train_mae.py              --config configs/mae_v3.yml
+#   python scripts/infer_mae.py              --config configs/mae_v3.yml
+# Precedence: CLI flag > this file > code default. Unknown keys are an error.
+# Relative paths are relative to the directory you run from (the repo root).
+# Mirrors the v3 command from 2026-11-03 (+ MAE encoder fix).
+# ──────────────────────────────────────────────────────────────────────────────
+run_name: mae_v3
+
+data:
+  # Train / test splits of data/captions/captions.csv (80/10/10 by source mesh).
+  train_csv: data/captions/caption_breakingbad_train_new.csv   # train_mae.py --csv
+  test_csv:  data/captions/caption_breakingbad_test_new.csv    # infer_mae.py --csv
+  root: /path/to/breaking_bad   # Breaking Bad dataset root; CSV `path`s are relative to it
+  classes: null            # null = all classes, or a list e.g. [Vase, Bowl]
+  val_split: 0.05          # fraction held out from train_csv for validation
+  val_split_by: object     # object = all rows of a source mesh in one split
+                           # (paper's protocol). row = legacy random_split,
+                           # reproduces v1/v2 val sets but leaks captions.
+  seed: 42
+
+# ── Geometry feature extraction  → DatasetConfig + .pt cache filename ────────
+# Must be identical for check_cache / train / infer. infer refuses to run if
+# these differ from the checkpoint's saved run_config.yml.
+geometry:
+  n_fps: 1024              # N   FPS points per mesh
+  use_tangent_disk: true   # false = point-only ablation (disk_grid forced to 1)
+  disk_grid: 32            # D   curvature-disk resolution (D x D)
+  disk_radius_frac: 0.07   # r_disk, fraction of bounding-sphere diameter
+  disk_fill: rbf           # rbf | nearest | zero
+  curv_knn: 30             # neighbours for quadric curvature fit
+  fourier_bands: 0         # 0 -> pos_enc = [xyz | normal] (6 dims)
+  curv_channels: 6         # 2 | 3 | 4 | 6  (6 = k1,k2,H,K,curvedness,shape index)
+
+# ── Curvature Token Encoder (GeometryProjector) ──────────────────────────────
+encoder:
+  proj_hidden: 256
+  mae_enc_layers: 4        # L_enc
+  mae_dec_layers: 2        # L_dec (training only)
+  mae_n_heads: 4
+  mae_mask_ratio: 0.5      # rho
+  mae_lam: 0.2             # lambda_mae  (paper Table 1 says 0.1 — reconcile)
+  mae_chunk_size: 32       # disks per encoder chunk (VRAM knob, not a model param)
+  proj_dropout: 0.1
+  max_geo_tokens: 512      # NOTE: < n_fps -> adjacent FPS tokens are avg-pooled
+                           # in pairs (FPS-adjacent != spatially adjacent).
+                           # Set to 1024 to feed all N tokens, as the paper says.
+
+# ── VLM backbone ─────────────────────────────────────────────────────────────
+model:
+  model_id: Qwen/Qwen2.5-VL-7B-Instruct
+  load_4bit: true          # QLoRA NF4 base during training
+  flash_attn: false
+
+lora:
+  lora_r: 32
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# ── Target JSON schema (order = generation order) ───────────────────────────
+prompt:
+  # "class" is always "" in the target (class is deliberately not given to the
+  # model) and is not in the system-prompt schema. Kept for v2 comparability;
+  # drop it for a cleaner target in new runs.
+  target_fields: [class, object_description, fracture_type, confidence, caption]
+
+# ── train_mae.py ─────────────────────────────────────────────────────────────
+train:
+  out: ./checkpoints/mae_v3
+  epochs: 5
+  batch: 2                 # >= 2 needed for the diversity loss to be non-zero
+  grad_accum: 8
+  lr: 2.0e-4               # LoRA LR  (write floats with a '.', e.g. 2.0e-4)
+  proj_lr: 1.0e-3          # CTE LR
+  warmup_ratio: 0.1        # fraction of each group's own span
+  lr_schedule: phase2      # phase2 = LoRA warms up when unfrozen; global = old OneCycleLR
+  weight_decay: 0.01
+  grad_clip: 1.0           # max grad-norm, applied separately to CTE and LoRA
+  max_seq_len: 512         # max target tokens (geometry prefix comes on top)
+  freeze_lm_steps: 2000    # stage 1: CTE-only steps
+  refreeze_on_new_lora_modules: true
+  div_lam: 0.05            # lambda_div
+  dataloader_workers: 2
+  resume: null             # e.g. ./checkpoints/mae_v3/ckpt_step3000
+  wandb: test_drive        # null disables W&B
+  log_steps: 20
+  save_steps: 1000
+  eval_steps: 200
+  log_target_samples: 3
+  sanity_check_every_save: true
+  sanity_sample_idx: 0
+  sanity_max_new_tokens: 200
+
+# ── infer_mae.py ─────────────────────────────────────────────────────────────
+infer:
+  ckpt: ./checkpoints/mae_v3/ckpt_best
+  out: outputs/predictions_mae_v3.csv
+  load_4bit: false         # false = bf16 base (previous behaviour);
+                           # true = same NF4 base the LoRA was trained against
+  num_samples: 2           # rows per object (caption_idx 0..n-1) -> Prediction 1/2
+  do_sample: true          # required for num_samples > 1 (greedy would repeat)
+  temperature: 0.7
+  top_p: 0.9
+  max_new_tokens: 512
+  device: cuda
+  allow_config_mismatch: false
+
+# ── Evaluation lives in configs/eval.yml (compares several runs / ablations).
+#    infer.out above is what eval.yml's `predictions:` entry for this run points at.
+
+# ── cache_dataset.py + check_cache.py (both cover train_csv and test_csv) ────
+cache:
+  workers: 4               # cache_dataset: processes (0/1 = serial)
+  threads_per_worker: 0    # 0 = cores // workers. Keep workers x threads <= cores.
+  max_tasks_per_child: 50  # recycle workers (Python >= 3.11) to cap memory growth
+  force: false             # cache_dataset: rebuild existing .pt files
+  skip_errors: true        # cache_dataset: keep going past failing meshes
+  check_mode: header       # check_cache: exists | header (fast, shapes) | full (reads data, NaN check)
+  check_workers: 16        # check_cache: parallel I/O threads
+  delete_bad: false        # check_cache: delete corrupt / wrong-shape .pt
+  quiet: false             # check_cache: summary only
