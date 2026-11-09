@@ -1,45 +1,30 @@
 """
 infer_mae.py
 ============
-Inference script for the MAE-based LoRA fine-tuned Qwen2.5-VL fracture captioner.
+Inference for the MAE Curvature-Token-Encoder + LoRA Qwen2.5-VL fracture
+captioner.
 
-Matches train_mae.py exactly:
-  - GeometryProjector: MAE encoder (chunked, Flash Attention SDPA)
-  - Decoder not used at inference (mask_ratio=0)
-  - _get_embed_tokens: PEFT-agnostic embed resolver
-  - max_geo_tokens: adaptive avg pool before LLM
-  - CURV_CHANNEL_MAP: same channel selection
-  - Checkpoint layout: ckpt_dir/lora_adapter/ + geometry_projector.pt
+The model code (GeometryProjector, prompts, target schema, prefix pooling) is
+IMPORTED from train_mae.py, so training and inference cannot drift apart.
 
 Usage
 -----
-  # Single OBJ file
-  python infer_mae.py \
-      --ckpt  ./checkpoints/ckpt_best \
-      --obj   path/to/fragment.obj \
-      --cls   teapot
+  # Everything from the run config (test_csv, ckpt, geometry, generation)
+  python scripts/infer_mae.py --config configs/mae_v3.yml
 
-  # Batch from CSV (same format as training CSV)
-  python infer_mae.py \
-      --ckpt  ./checkpoints/ckpt_best \
-      --csv   test_set.csv \
-      --root  /path/to/breaking_bad \
-      --out   predictions.csv
+  # No --config: settings are read from <ckpt>/run_config.yml (saved by training)
+  python infer_mae.py --ckpt ./checkpoints_mae_v3/ckpt_best \
+      --csv caption_breakingbad_test_new.csv --root . --out preds.csv
 
-  # Must match training hyperparameters:
-  python infer_mae.py \
-      --ckpt ./checkpoints/ckpt_best \
-      --csv  test_set.csv --root . \
-      --n_fps 1024 --disk_grid 16 --curv_channels 3 \
-      --proj_hidden 256 --mae_enc_layers 4 --mae_n_heads 4 \
-      --max_geo_tokens 256
+  # Single OBJ
+  python scripts/infer_mae.py --config configs/mae_v3.yml --obj path/to/piece_0.obj
 
-Notes
------
-  * Decoder weights (dec_embed, decoder, dec_norm, dec_pred) are loaded but
-    never called — they stay in RAM. Use --merge to merge LoRA and drop decoder
-    weights for a leaner inference binary.
-  * use_cache is re-enabled at inference for fast KV-cache autoregressive decoding.
+Before generating, the geometry/encoder settings are compared with the
+checkpoint's run_config.yml; any mismatch stops the run
+(override with --allow_config_mismatch).
+
+Output CSV: one row per (object, sample) with caption_idx = 0..num_samples-1,
+which caption_evaluation.ipynb pivots into caption_pred_0, caption_pred_1, ...
 """
 
 from __future__ import annotations
@@ -49,11 +34,18 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
 
-import numpy as np
 import torch
-import torch.nn as nn
+
+sys.path.insert(0, str(Path(__file__).parent))
+from run_config import (  # noqa: E402
+    SAVED_CONFIG_NAME, check_consistency, log_resolved, parse_with_config,
+)
+from train_mae import (  # noqa: E402
+    CURV_CHANNEL_MAP, CURV_CHANNEL_NAMES, DEFAULT_TARGET_FIELDS, GeometryProjector,
+    _get_embed_tokens, build_chat_text, load_projector_state, pool_geo_tokens,
+    pos_enc_dim_for,
+)
 
 log = logging.getLogger(__name__)
 
@@ -62,515 +54,167 @@ log = logging.getLogger(__name__)
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Inference — MAE GeometryProjector + Qwen2.5-VL LoRA fracture captioner"
-    )
+        description="Inference — MAE GeometryProjector + Qwen2.5-VL LoRA fracture captioner")
 
-    # Checkpoint
-    p.add_argument("--ckpt",     required=True,
-                   help="Checkpoint dir (e.g. checkpoints/ckpt_best)")
-    p.add_argument("--model_id", default="Qwen/Qwen2.5-VL-7B-Instruct",
-                   help="Base model ID (must match training)")
+    # Checkpoint / model
+    p.add_argument("--ckpt", required=True, help="Checkpoint dir (e.g. checkpoints/ckpt_best)")
+    p.add_argument("--model_id", default="Qwen/Qwen2.5-VL-7B-Instruct")
+    p.add_argument("--load_4bit", action="store_true", default=False,
+                   help="Load the base model in NF4 (as in training). Default bf16.")
+    p.add_argument("--no_4bit", dest="load_4bit", action="store_false")
+    p.add_argument("--flash_attn", action="store_true", default=False)
+    p.add_argument("--device", default="cuda")
 
     # Input — single file OR batch CSV
-    p.add_argument("--obj",   default=None, help="Single OBJ file path")
-    p.add_argument("--cls",   default="unknown", help="Object class for single-file mode")
-    p.add_argument("--csv",   default=None, help="CSV with columns: path, class (batch mode)")
-    p.add_argument("--root",  default=".", help="Dataset root prepended to CSV paths")
+    p.add_argument("--obj",  default=None, help="Single OBJ file path")
+    p.add_argument("--cls",  default="unknown", help="Object class (single-file mode, logging only)")
+    p.add_argument("--csv",  default=None, help="CSV with columns: path, class")
+    p.add_argument("--root", default=".", help="Dataset root prepended to CSV paths")
+    p.add_argument("--out",  default=None, help="Output CSV (batch mode)")
 
-    # Output
-    p.add_argument("--out",   default=None,
-                   help="Output CSV path (batch mode). Omit to print to stdout.")
+    # Geometry + encoder — must match training (checked against ckpt config)
+    p.add_argument("--n_fps",            type=int,   default=512)
+    p.add_argument("--disk_grid",        type=int,   default=16)
+    p.add_argument("--disk_radius_frac", type=float, default=0.07)
+    p.add_argument("--disk_fill",        default="rbf", choices=["rbf", "nearest", "zero"])
+    p.add_argument("--curv_knn",         type=int,   default=30)
+    p.add_argument("--fourier_bands",    type=int,   default=0)
+    p.add_argument("--curv_channels",    type=int,   default=3, choices=[2, 3, 4, 6])
+    p.add_argument("--use_tangent_disk", action="store_false", default=True,
+                   help="PASSING this flag turns tangent-disk mode OFF (point mode). "
+                        "In YAML use `use_tangent_disk: false`.")
+    p.add_argument("--proj_hidden",      type=int,   default=256)
+    p.add_argument("--mae_enc_layers",   type=int,   default=4)
+    p.add_argument("--mae_dec_layers",   type=int,   default=2)
+    p.add_argument("--mae_n_heads",      type=int,   default=4)
+    p.add_argument("--mae_chunk_size",   type=int,   default=128,
+                   help="VRAM knob only — may differ from training")
+    p.add_argument("--max_geo_tokens",   type=int,   default=512)
+    p.add_argument("--target_fields", nargs="*", default=DEFAULT_TARGET_FIELDS,
+                   help="Fields written to the output CSV (should match training)")
 
-    # Geometry — must match training exactly
-    p.add_argument("--n_fps",         type=int,   default=512,
-                   help="Must match training --n_fps")
-    p.add_argument("--disk_grid",     type=int,   default=16,
-                   help="Must match training --disk_grid")
-    p.add_argument("--curv_channels", type=int,   default=3, choices=[2, 3, 4, 6],
-                   help="Must match training --curv_channels")
-    p.add_argument("--proj_hidden",   type=int,   default=256,
-                   help="Must match training --proj_hidden")
-    p.add_argument("--mae_enc_layers",type=int,   default=4,
-                   help="Must match training --mae_enc_layers")
-    p.add_argument("--mae_dec_layers",type=int,   default=2,
-                   help="Must match training --mae_dec_layers (loaded but unused at inference)")
-    p.add_argument("--mae_n_heads",   type=int,   default=4,
-                   help="Must match training --mae_n_heads")
-    p.add_argument("--mae_chunk_size",type=int,   default=128,
-                   help="Chunked encoder batch size — can differ from training, lower = less VRAM")
-    p.add_argument("--max_geo_tokens",type=int,   default=512,
-                   help="Must match training --max_geo_tokens (caps prefix length to LLM)")
-    p.add_argument(
-        "--use_tangent_disk",
-        action="store_false",
-        default=True,
-        help="Must match the training run. Tangent-disk mode is ON by "
-             "default; PASSING this flag turns it OFF (point-mode ablation). "
-             "If the checkpoint was trained with --use_tangent_disk passed "
-             "(point mode), pass it here too — otherwise geometry "
-             "preprocessing won't match what the checkpoint was trained on."
-    )
     # Generation
-    p.add_argument("--max_new_tokens",type=int,   default=512)
-    p.add_argument("--temperature",   type=float, default=0.1,
-                   help="Low temperature for deterministic structured output")
-    p.add_argument("--do_sample",     action="store_true", default=False)
-    p.add_argument("--flash_attn",    action="store_true", default=False,
-                   help="Enable Flash Attention 2 for LLM. "
-                        "Requires: pip install flash-attn --no-build-isolation")
-    p.add_argument("--device",        default="cuda")
-
-    return p.parse_args()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Constants — must match train_mae.py exactly
-# ──────────────────────────────────────────────────────────────────────────────
-
-CURV_CHANNEL_MAP = {
-    2: [0, 1],
-    3: [1, 4, 5],
-    4: [0, 1, 2, 3],
-    6: [0, 1, 2, 3, 4, 5],
-}
-
-CURV_CHANNEL_NAMES = {
-    0: "kmin", 1: "kmax", 2: "mean_curv",
-    3: "gauss_curv", 4: "curvedness", 5: "shape_index",
-}
-
-TARGET_FIELDS = [
-    "class",
-    "object_description",
-    "fracture_type",
-    "confidence",
-    "caption",
-]
-
-SYSTEM_MSG = """\
-You are a precise 3D fracture analyst.
-
-You will receive geometry embeddings representing a fractured 3D object as a prefix to the conversation.
-
-Your task is to infer the object's overall shape and fracture characteristics solely from the provided geometry. Do not rely on any external knowledge or assumptions.
-
-Return exactly one valid JSON object with no additional text, markdown, or code blocks.
-
-The JSON must have exactly this structure:
-
-{
-  "object_description": "Shape, structure, proportions, and notable features of the original object. One or two sentences, maximum 30 words.",
-  "confidence": "low | medium | high",
-  "fracture_type": "BOUNDARY | INTERIOR",
-  "caption": "One concise sentence describing the object and the location and nature of the fracture. Maximum 25 words."
-}
-
-Rules:
-- Output valid JSON only.
-- Exactly one sentence for every field (two allowed only for object_description).
-- Stay within the stated word limits.
-- Base every field only on the supplied geometry.
-- Do not mention geometry embeddings, tokens, prefixes, meshes, vertices, faces, triangles, point clouds, or any internal representation.
-- Do not speculate beyond what the geometry supports. If the geometry is insufficient, express uncertainty only through the confidence field.
-- Do not repeat information across fields.
-- Describe fracture locations relative to the object's own structure (e.g. "along the rim", "near the handle", "at the base", "near one corner", "along an outer edge", "on a flat face"), never relative to a viewpoint.
-- Prefer concrete structural vocabulary such as edge, lip, border, perimeter, opening, corner, face, shoulder, junction, base, rim, handle, and tip.
-- The caption should describe only geometrically observable properties. Do not infer material, manufacturing process, cause of fracture, or object function unless clearly supported by the geometry.
-"""
-
-# CLASS NAME INTENTIONALLY REMOVED from user message — must match train_mae.py
-# exactly, since the LoRA adapter was fine-tuned against this precise prompt
-# text. Any drift here (wording, schema description, rules) is an
-# out-of-distribution prompt at inference time even if the JSON *looks*
-# similar, and produces exactly the "sporadically empty/inconsistent field"
-# behavior you'd otherwise mistake for a model-quality problem.
-USER_MSG = """\
-Analyze the provided fractured object geometry.
-
-Classify the fracture as one of:
-- BOUNDARY: the missing fragment was attached along an outer edge, tip, handle, rim, or other protruding feature.
-- INTERIOR: the missing fragment originated from a flat, recessed, or enclosed surface rather than an outer boundary.
-
-Return the required JSON object.
-"""
+    p.add_argument("--max_new_tokens", type=int,   default=512)
+    p.add_argument("--do_sample",      action="store_true", default=False)
+    p.add_argument("--greedy",         dest="do_sample", action="store_false")
+    p.add_argument("--temperature",    type=float, default=0.7)
+    p.add_argument("--top_p",          type=float, default=0.9)
+    p.add_argument("--num_samples",    type=int,   default=1,
+                   help="Captions per object (caption_idx 0..n-1); >1 needs do_sample")
+    p.add_argument("--seed",           type=int,   default=42)
+    p.add_argument("--allow_config_mismatch", action="store_true", default=False)
+    return p
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# GeometryProjector — mirrors train_mae.py exactly
-# ──────────────────────────────────────────────────────────────────────────────
-
-class _TransformerBlock(nn.Module):
-    """
-    Single pre-norm transformer block — Flash Attention via SDPA (PyTorch 2.0+).
-    Mirrors train_mae.py _TransformerBlock exactly.
-    """
-    def __init__(self, hidden: int, n_heads: int, mlp_ratio: float = 2.0,
-                 dropout: float = 0.0):
-        super().__init__()
-        assert hidden % n_heads == 0, \
-            f"hidden={hidden} must be divisible by n_heads={n_heads}"
-        self.n_heads  = n_heads
-        self.head_dim = hidden // n_heads
-        self.dropout  = dropout
-
-        self.norm1 = nn.LayerNorm(hidden)
-        self.qkv   = nn.Linear(hidden, hidden * 3, bias=False)
-        self.out   = nn.Linear(hidden, hidden,     bias=False)
-        self.norm2 = nn.LayerNorm(hidden)
-        dim_ff = int(hidden * mlp_ratio)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden, dim_ff, bias=False),
-            nn.GELU(),
-            nn.Linear(dim_ff, hidden, bias=False),
-        )
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, S, H = x.shape
-        nh, hd  = self.n_heads, self.head_dim
-        h   = self.norm1(x)
-        qkv = self.qkv(h).reshape(B, S, 3, nh, hd).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-        dp = self.dropout if self.training else 0.0
-        h  = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, dropout_p=dp, is_causal=False,
-        )
-        h = h.permute(0, 2, 1, 3).reshape(B, S, H)
-        h = self.out(h)
-        x = x + self.drop(h)
-        x = x + self.drop(self.ffn(self.norm2(x)))
-        return x
-
-
-class GeometryProjector(nn.Module):
-    """
-    MAE-style geometry projector — inference-mode.
-
-    At inference mask_ratio=0: encoder sees all spatial tokens, decoder is unused.
-    Encoder runs in chunks of chunk_size to keep QKV bounded.
-    """
-    def __init__(
-        self,
-        c_in: int,
-        d_grid: int,
-        d_model: int,
-        pos_enc_dim: int = 6,
-        hidden: int = 256,
-        n_heads: int = 4,
-        enc_layers: int = 4,
-        dec_layers: int = 2,
-        mask_ratio: float = 0.0,   # always 0 at inference
-        dropout: float = 0.1,
-        chunk_size: int = 128,
-    ):
-        super().__init__()
-        self.c_in        = c_in
-        self.d_grid      = d_grid
-        self.pos_enc_dim = pos_enc_dim
-        self.hidden      = hidden
-        self.mask_ratio  = mask_ratio
-        self.chunk_size  = chunk_size
-        self.n_spatial   = d_grid * d_grid
-
-        self.patch_embed = nn.Linear(c_in + pos_enc_dim, hidden, bias=False)
-        self.spatial_pos = nn.Parameter(torch.zeros(1, self.n_spatial, hidden))
-        nn.init.trunc_normal_(self.spatial_pos, std=0.02)
-
-        # mask_token loaded from checkpoint but never used at inference
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, hidden))
-        nn.init.trunc_normal_(self.mask_token, std=0.02)
-
-        self.encoder = nn.ModuleList([
-            _TransformerBlock(hidden, n_heads, dropout=dropout)
-            for _ in range(enc_layers)
-        ])
-        self.enc_norm = nn.LayerNorm(hidden)
-
-        # Decoder weights — loaded from checkpoint, unused at inference
-        self.dec_embed = nn.Linear(hidden, hidden, bias=False)
-        self.decoder   = nn.ModuleList([
-            _TransformerBlock(hidden, n_heads, dropout=dropout)
-            for _ in range(dec_layers)
-        ])
-        self.dec_norm  = nn.LayerNorm(hidden)
-        self.dec_pred  = nn.Linear(hidden, c_in + pos_enc_dim, bias=True)
-
-        self.out_proj = nn.Sequential(
-            nn.LayerNorm(hidden),
-            nn.Linear(hidden, d_model, bias=False),
-            nn.LayerNorm(d_model),
-        )
-
-    def _spatial_tokens(self, patches: torch.Tensor, pos_enc: torch.Tensor) -> torch.Tensor:
-        BN, C, S = patches.shape
-        x  = patches.permute(0, 2, 1)
-        pe = pos_enc.unsqueeze(1).expand(-1, S, -1)
-        x  = torch.cat([x, pe], dim=-1)
-        x  = self.patch_embed(x)
-        x  = x + self.spatial_pos.reshape(1, S, self.hidden)
-        return x
-
-    @torch.no_grad()
-    def forward(
-        self,
-        patches: torch.Tensor,   # (B, N, C_in, D, D)
-        pos_enc: torch.Tensor,   # (B, N, pos_enc_dim)
-    ) -> torch.Tensor:           # (B, N, d_model)
-        """
-        Inference-mode forward — no masking, decoder not called.
-        Chunked encoder keeps memory bounded.
-        """
-        B, N, C, D, _ = patches.shape
-        BN = B * N
-        S  = D * D
-
-        x  = patches.reshape(BN, C, S)
-        pe = pos_enc.reshape(BN, self.pos_enc_dim)
-        tok = self._spatial_tokens(x, pe)   # (BN, S, hidden) — full, no masking
-
-        chunk = self.chunk_size
-        out_chunks = []
-        for start in range(0, BN, chunk):
-            end   = min(start + chunk, BN)
-            t_ch  = tok[start:end]
-            for blk in self.encoder:
-                t_ch = blk(t_ch)
-            t_ch = self.enc_norm(t_ch)
-            pooled_ch = t_ch.mean(dim=1)         # (C, hidden)
-            out_ch    = self.out_proj(pooled_ch)  # (C, d_model)
-            out_chunks.append(out_ch)
-
-        out = torch.cat(out_chunks, dim=0)        # (BN, d_model)
-        return out.reshape(B, N, -1)              # (B, N, d_model)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Embed-token resolver — mirrors train_mae.py exactly
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _get_embed_tokens(llm):
-    for name, mod in llm.named_modules():
-        if name.endswith("embed_tokens"):
-            return mod
-    raise AttributeError(
-        "embed_tokens not found. "
-        f"First 40 modules: {[n for n, _ in llm.named_modules()][:40]}"
-    )
+def parse_args(argv=None) -> argparse.Namespace:
+    args = parse_with_config(build_parser(), "infer", argv)
+    if args.num_samples > 1 and not args.do_sample:
+        raise SystemExit("[error] num_samples > 1 with greedy decoding gives identical "
+                         "captions — set do_sample: true (or --do_sample).")
+    return args
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Model loading
 # ──────────────────────────────────────────────────────────────────────────────
 
-def load_model(args) -> tuple:
-    """
-    Load the fine-tuned LLM (base + LoRA adapter) and GeometryProjector.
-
-    Checkpoint layout:
-        ckpt_dir/
-            lora_adapter/          HF PeftModel weights + tokenizer
-            geometry_projector.pt  plain state_dict
-    """
-    from transformers import AutoTokenizer
+def load_model(args):
+    """Base Qwen2.5-VL + LoRA adapter + GeometryProjector from args.ckpt."""
+    from transformers import AutoTokenizer, BitsAndBytesConfig
     from transformers import Qwen2_5_VLForConditionalGeneration
     from peft import PeftModel
 
     ckpt_dir    = Path(args.ckpt)
     adapter_dir = ckpt_dir / "lora_adapter"
     proj_path   = ckpt_dir / "geometry_projector.pt"
-
     if not adapter_dir.exists():
         raise FileNotFoundError(f"No lora_adapter dir at {adapter_dir}")
     if not proj_path.exists():
         raise FileNotFoundError(f"No geometry_projector.pt at {proj_path}")
 
-    log.info(f"Loading tokenizer from {adapter_dir}")
     tokenizer = AutoTokenizer.from_pretrained(adapter_dir, trust_remote_code=True)
 
-    # Flash Attention for LLM — mirrors train_mae.py logic
+    attn_impl = "sdpa"
     if args.flash_attn:
         try:
             import flash_attn  # noqa: F401
             attn_impl = "flash_attention_2"
-            log.info("Flash Attention 2 enabled for LLM")
         except ImportError:
-            attn_impl = "sdpa"
             log.warning("flash-attn not installed — falling back to SDPA")
-    else:
-        attn_impl = "sdpa"
-        log.info("LLM attention: SDPA (PyTorch built-in Flash Attention)")
 
-    log.info(f"Loading base model {args.model_id}")
+    bnb_cfg = None
+    if args.load_4bit:
+        bnb_cfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                     bnb_4bit_use_double_quant=True,
+                                     bnb_4bit_compute_dtype=torch.bfloat16)
+    log.info(f"Loading base model {args.model_id} ({'NF4' if args.load_4bit else 'bf16'}, {attn_impl})")
     base_llm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        args.model_id,
-        torch_dtype          = torch.bfloat16,
-        device_map           = args.device,
-        trust_remote_code    = True,
-        attn_implementation  = attn_impl,
+        args.model_id, quantization_config=bnb_cfg,
+        torch_dtype=None if args.load_4bit else torch.bfloat16,
+        device_map=args.device, trust_remote_code=True, attn_implementation=attn_impl,
     )
-
-    log.info("Merging LoRA adapter")
     llm = PeftModel.from_pretrained(base_llm, adapter_dir)
-
-    # Re-enable KV cache — was disabled during training for gradient checkpointing
     llm.config.use_cache = True
     llm.eval()
 
-    log.info("Loading GeometryProjector")
-    d_model = llm.config.text_config.hidden_size   # 3584 for Qwen2.5-VL-7B
-
     projector = GeometryProjector(
-        c_in        = args.curv_channels,
-        d_grid      = args.disk_grid,
-        d_model     = d_model,
-        pos_enc_dim = 6,                      # fourier_bands=0 during training
-        hidden      = args.proj_hidden,
-        n_heads     = args.mae_n_heads,
-        enc_layers  = args.mae_enc_layers,
-        dec_layers  = args.mae_dec_layers,
-        mask_ratio  = 0.0,                    # always 0 at inference
-        dropout     = 0.0,                    # no dropout at inference
-        chunk_size  = args.mae_chunk_size,
+        c_in=args.curv_channels, d_grid=args.disk_grid,
+        d_model=llm.config.text_config.hidden_size,
+        pos_enc_dim=pos_enc_dim_for(args.fourier_bands), hidden=args.proj_hidden,
+        n_heads=args.mae_n_heads, enc_layers=args.mae_enc_layers,
+        dec_layers=args.mae_dec_layers, mask_ratio=0.0, dropout=0.0,
+        chunk_size=args.mae_chunk_size,
     ).to(args.device)
-
-    projector.load_state_dict(
-        torch.load(proj_path, map_location=args.device, weights_only=True)
-    )
+    load_projector_state(projector, proj_path, args.device)
     projector.eval()
-
     log.info(f"Projector params: {sum(p.numel() for p in projector.parameters()):,}")
-    log.info("Models ready.")
     return llm, projector, tokenizer
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Mesh processing
+# Geometry + generation
 # ──────────────────────────────────────────────────────────────────────────────
 
-def process_single_obj(
-    obj_path: str | Path,
-    n_fps: int,
-    disk_grid: int,
-    curv_ch_idx: list[int],
-    device: str,
-    use_tangent_disk: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Run the full geometry pipeline on one OBJ file.
-    Returns patches (1, N, C_in, D, D) and pos_enc (1, N, 6) on device.
-    Reuses .pt cache if present — must match config used during training.
-    """
-    sys.path.insert(0, str(Path(__file__).parent))
+def process_single_obj(obj_path, args, curv_ch_idx):
+    """Same DatasetConfig as training → reuses the training .pt cache."""
     from BreakingBadDataset import DatasetConfig, process_mesh
-
     cfg = DatasetConfig(
-        n_fps          = n_fps,
-        disk_grid      = disk_grid,
-        disk_radius_frac = 0.07,
-        disk_channels  = 6,           # always compute all 6, we select below
-        disk_fill      = "rbf",
-        curv_knn       = 30,
-        cache_processed= True,
-        fourier_bands  = 0,           # pos_enc dim = 6
-        use_tangent_disk = use_tangent_disk,
+        n_fps=args.n_fps, disk_grid=args.disk_grid,
+        disk_radius_frac=args.disk_radius_frac, disk_channels=6,
+        disk_fill=args.disk_fill, curv_knn=args.curv_knn, cache_processed=True,
+        fourier_bands=args.fourier_bands, use_tangent_disk=args.use_tangent_disk,
     )
+    t = process_mesh(Path(obj_path), cfg)
+    patches = t["data"][:, curv_ch_idx, :, :].unsqueeze(0).to(args.device)
+    pos_enc = t["pos_enc"].unsqueeze(0).to(args.device)
+    return patches, pos_enc
 
-    tensors = process_mesh(Path(obj_path), cfg)
-
-    # Select curvature channels used during training
-    patches = tensors["data"][:, curv_ch_idx, :, :]   # [N, C_in, D, D]
-    pos_enc = tensors["pos_enc"]                        # [N, 6]
-
-    return (
-        patches.unsqueeze(0).to(device),    # [1, N, C_in, D, D]
-        pos_enc.unsqueeze(0).to(device),    # [1, N, 6]
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Prompt building
-# ──────────────────────────────────────────────────────────────────────────────
-
-def build_prompt_ids(tokenizer, device: str) -> torch.Tensor:
-    """Tokenise the system+user prompt. No class name — mirrors train_mae.py."""
-    messages = [
-        {"role": "system", "content": SYSTEM_MSG},
-        {"role": "user",   "content": USER_MSG},
-    ]
-    text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
-    )
-    ids = tokenizer(
-        text, add_special_tokens=False, return_tensors="pt",
-    ).input_ids
-    return ids.to(device)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Generation with geometry prefix
-# ──────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def generate_caption(
-    llm,
-    projector: GeometryProjector,
-    tokenizer,
-    patches: torch.Tensor,     # (1, N, C_in, D, D)
-    pos_enc: torch.Tensor,     # (1, N, 6)
-    args,
-) -> str:
-    """
-    Geometry prefix injection + autoregressive generation.
-    Mirrors the inference path of forward_with_geo_prefix in train_mae.py.
-    """
-    device = args.device
+def generate_captions(llm, projector, tokenizer, patches, pos_enc, args) -> list[str]:
+    """Geometry prefix + prompt → num_samples generations."""
+    geo_embeds  = projector(patches, pos_enc)
+    prompt_ids  = tokenizer(build_chat_text("", tokenizer), add_special_tokens=False,
+                            return_tensors="pt").input_ids.to(args.device)
+    text_embeds = _get_embed_tokens(llm)(prompt_ids)
+    geo_embeds  = pool_geo_tokens(geo_embeds.to(text_embeds.dtype), args.max_geo_tokens)
+    full_embeds = torch.cat([geo_embeds, text_embeds], dim=1)
 
-    # 1. Geometry prefix: (1, N, d_model) — chunked encoder, no masking
-    geo_embeds = projector(patches, pos_enc)           # float32
-
-    # 2. Text embeddings
-    prompt_ids  = build_prompt_ids(tokenizer, device)  # (1, T_prompt)
-    text_embeds = _get_embed_tokens(llm)(prompt_ids)   # (1, T_prompt, d_model)
-
-    # 3. Cast geo to LLM dtype (bfloat16)
-    geo_embeds_f32 = geo_embeds
-    geo_embeds     = geo_embeds.to(text_embeds.dtype)
-    del geo_embeds_f32
-
-    # 4. Pool geo tokens if > max_geo_tokens — mirrors train_mae.py step 3
-    max_geo = args.max_geo_tokens
-    if geo_embeds.shape[1] > max_geo:
-        ge_t       = geo_embeds.permute(0, 2, 1)
-        ge_t       = torch.nn.functional.adaptive_avg_pool1d(ge_t, max_geo)
-        geo_embeds = ge_t.permute(0, 2, 1)
-
-    # 5. Concatenate [geo prefix | prompt]
-    full_embeds = torch.cat([geo_embeds, text_embeds], dim=1)   # (1, N+T, d_model)
-
-    # 6. Attention mask — all ones (no padding)
-    full_mask = torch.ones(
-        1, full_embeds.shape[1], dtype=torch.long, device=device,
+    gen_kw = dict(max_new_tokens=args.max_new_tokens, do_sample=args.do_sample,
+                  pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                  eos_token_id=tokenizer.eos_token_id)
+    if args.do_sample:
+        gen_kw.update(temperature=args.temperature, top_p=args.top_p,
+                      num_return_sequences=args.num_samples)
+    out_ids = llm.generate(
+        inputs_embeds=full_embeds,
+        attention_mask=torch.ones(1, full_embeds.shape[1], dtype=torch.long, device=args.device),
+        **gen_kw,
     )
+    return [tokenizer.decode(o, skip_special_tokens=True).strip() for o in out_ids]
 
-    # 7. Generate — inputs_embeds so model continues from our prefix
-    output_ids = llm.generate(
-        inputs_embeds  = full_embeds,
-        attention_mask = full_mask,
-        max_new_tokens = args.max_new_tokens,
-        do_sample      = args.do_sample,
-        temperature    = args.temperature if args.do_sample else None,
-        pad_token_id   = tokenizer.pad_token_id or tokenizer.eos_token_id,
-        eos_token_id   = tokenizer.eos_token_id,
-    )
-
-    return tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# JSON parsing + pretty print
-# ──────────────────────────────────────────────────────────────────────────────
 
 def parse_output(raw: str) -> dict:
     text = raw.strip()
@@ -585,51 +229,42 @@ def parse_output(raw: str) -> dict:
             return obj
     except json.JSONDecodeError:
         pass
-    return {"_parse_error": True, "_raw": raw}
-
-
-def pretty_print(result: dict, obj_path: str):
-    print(f"\n{'─'*60}")
-    print(f"  OBJ: {obj_path}")
-    print(f"{'─'*60}")
-    if result.get("_parse_error"):
-        print(f"  [PARSE ERROR] Raw:\n{result.get('_raw', '')}")
-        return
-    for field in TARGET_FIELDS:
-        print(f"  {field:<24} {result.get(field, '—')}")
-    print(f"  [RAW] {result.get('_raw', '—')}")
-    print()
+    return {"_parse_error": True}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+    args = parse_args(argv)
+    log_resolved(args)
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
-    sys.path.insert(0, str(Path(__file__).parent))
+    # ── Train/infer consistency check ────────────────────────────────────────
+    saved = Path(args.ckpt) / SAVED_CONFIG_NAME
+    if saved.is_file():
+        problems = check_consistency(args, saved)
+        if problems:
+            msg = "Settings differ from the checkpoint's training config:\n  - " + \
+                  "\n  - ".join(problems)
+            if args.allow_config_mismatch:
+                log.warning(msg + "\n(continuing: --allow_config_mismatch)")
+            else:
+                raise SystemExit(f"[error] {msg}\nFix the config, or pass "
+                                 f"--allow_config_mismatch if this is intentional.")
+        log.info(f"Config consistent with {saved}")
+    else:
+        log.warning(f"{saved} not found (checkpoint predates run configs) — cannot "
+                    f"verify that geometry/encoder settings match training.")
 
     curv_ch_idx = CURV_CHANNEL_MAP[args.curv_channels]
-    log.info(
-        f"Config  n_fps={args.n_fps}  disk_grid={args.disk_grid}  "
-        f"curv_channels={args.curv_channels} {[CURV_CHANNEL_NAMES[i] for i in curv_ch_idx]}  "
-        f"max_geo_tokens={args.max_geo_tokens}"
-        f"using disk={args.use_tangent_disk}"
-    )
+    log.info(f"Curvature channels: {[CURV_CHANNEL_NAMES[i] for i in curv_ch_idx]}")
+    torch.manual_seed(args.seed)
 
-    # ── Load model ────────────────────────────────────────────────────────────
-    llm, projector, tokenizer = load_model(args)
-
-    # ── Build job list ────────────────────────────────────────────────────────
+    # ── Jobs ─────────────────────────────────────────────────────────────────
     jobs: list[tuple[str, str]] = []
-
     if args.obj:
         jobs.append((args.obj, args.cls))
     elif args.csv:
@@ -638,61 +273,38 @@ def main():
         df.columns = df.columns.str.strip()
         if "path" not in df.columns or "class" not in df.columns:
             sys.exit("[error] CSV must have 'path' and 'class' columns")
+        df = df.drop_duplicates("path")       # GT CSVs have one row per caption
         root = Path(args.root)
-        for _, row in df.iterrows():
-            jobs.append((str(root / row["path"].strip()), row["class"].strip()))
-        log.info(f"Batch mode: {len(jobs)} files")
+        jobs = [(str(root / r["path"].strip()), r["class"].strip()) for _, r in df.iterrows()]
+        log.info(f"Batch mode: {len(jobs)} objects × {args.num_samples} sample(s)")
     else:
-        sys.exit("[error] Provide either --obj or --csv")
+        sys.exit("[error] Provide --obj or --csv (or data.test_csv in the config)")
 
-    # ── Run inference ─────────────────────────────────────────────────────────
-    results = []
+    llm, projector, tokenizer = load_model(args)
 
+    rows = []
     for i, (obj_path, obj_class) in enumerate(jobs):
         log.info(f"[{i+1}/{len(jobs)}] {obj_path}  class={obj_class}")
-
-        # Geometry
         try:
-            patches, pos_enc = process_single_obj(
-                obj_path, args.n_fps, args.disk_grid, curv_ch_idx, args.device, args.use_tangent_disk
-            )
+            patches, pos_enc = process_single_obj(obj_path, args, curv_ch_idx)
+            raws = generate_captions(llm, projector, tokenizer, patches, pos_enc, args)
         except Exception as e:
-            log.error(f"  Mesh processing failed: {e}")
-            results.append({"path": obj_path, "class": obj_class,
-                             "_parse_error": True, "_raw": str(e)})
-            continue
-
-        # Generate
-        try:
-            raw    = generate_caption(llm, projector, tokenizer, patches, pos_enc, args)
+            log.error(f"  failed: {e}")
+            raws = [f"<error: {e}>"] * args.num_samples
+        for k, raw in enumerate(raws):
             parsed = parse_output(raw)
-        except Exception as e:
-            log.error(f"  Generation failed: {e}")
-            results.append({"path": obj_path, "class": obj_class,
-                             "_parse_error": True, "_raw": str(e)})
-            continue
-        
-        parsed["path"]  = obj_path
-        parsed["true_class"] = obj_class
-        parsed["_raw"]  = raw
-        results.append(parsed)
-        pretty_print(parsed, obj_path)
-
-    # ── Save results ──────────────────────────────────────────────────────────
-    if args.out and results:
-        import pandas as pd
-        rows = []
-        for r in results:
-            row = {"path": r.get("path", ""), "class": r.get("class", "")}
-            for field in TARGET_FIELDS:
-                row[field] = r.get(field, "")
-            row["true_class"] = r.get("true_class", "")
-            row["parse_error"] = r.get("_parse_error", False)
-            row["raw_output"]  = r.get("_raw", "")
+            row = {"path": obj_path, "caption_idx": k, "true_class": obj_class}
+            for f in args.target_fields:
+                row[f] = parsed.get(f, "")
+            row["parse_error"] = bool(parsed.get("_parse_error", False))
+            row["raw_output"]  = raw
             rows.append(row)
+            print(f"  [{k}] {row.get('caption', '') or raw[:200]}")
+
+    if args.out and rows:
+        import pandas as pd
         pd.DataFrame(rows).to_csv(args.out, index=False)
         log.info(f"Saved {len(rows)} predictions → {args.out}")
-
     log.info("Done.")
 
 

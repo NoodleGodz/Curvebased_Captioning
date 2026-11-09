@@ -3,3 +3,10 @@ data/renders/
 *.pt
 __pycache__/
 wandb/
+outputs/
+eval_outputs*/
+.clip_cache/
+bad_cache.txt
+cache_errors.txt
+*.pt.tmp*
+.pytest_cache/
