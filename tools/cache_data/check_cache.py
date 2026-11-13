@@ -1,257 +1,235 @@
 """
-check_cache.py — validate per-config .pt cache files against current config.
+check_cache.py — validate per-config .pt cache files against the run config.
 
-Cache filename format (from _cache_path in BreakingBadDataset.py):
-    <stem>__n<n_fps>_g<disk_grid>_c<disk_channels>_r<radius*1000>_<fill>_k<knn>_f<fourier>.pt
-    e.g.  piece_0__n512_g16_c6_r050_rbf_k10_f0.pt
+The cache filename and expected shapes come from BreakingBadDataset itself
+(_cache_path + DatasetConfig), so this cannot drift from what training and
+inference load.
 
-Checks per file:
-  1. File exists (with the correct config-encoded name)
-  2. torch.load succeeds (not corrupt)
-  3. Tensor shapes match config
+Modes (--check_mode)
+--------------------
+  exists  only checks the file is there                       (seconds)
+  header  DEFAULT. Opens each file memory-mapped and checks keys + shapes
+          without reading tensor data; a truncated/broken file still fails
+          because the zip directory sits at the end of the file.  (fast)
+  full    reads every tensor and also checks for NaN/Inf.      (slow, ~25 MB/file
+          at n_fps=1024, D=32)
+
+Files are checked in parallel threads (--check_workers); the work is I/O.
 
 Usage
 -----
-    python check_cache.py --csv captions.csv --root .
-
-    # With explicit config (must match cache_dataset.py / training args):
-    python check_cache.py --csv captions.csv --root . \\
-        --n_fps 512 --disk_grid 16 --disk_channels 6 \\
-        --disk_radius_frac 0.05 --disk_fill rbf \\
-        --curv_knn 10 --fourier_bands 0
-
-    # Auto-delete bad files so cache_dataset.py will rebuild them:
-    python check_cache.py --csv captions.csv --root . --delete_bad
+    python tools/cache_data/check_cache.py --config configs/mae_v3.yml                      # header mode
+    python tools/cache_data/check_cache.py --config configs/mae_v3.yml --check_mode full    # deep check
+    python tools/cache_data/check_cache.py --config configs/mae_v3.yml --delete_bad         # then rebuild
+    python tools/cache_data/check_cache.py --csv train.csv --root . --n_fps 768 --disk_grid 32
 """
 
 import argparse
-import sys
-from pathlib import Path
+import logging
 import os
-os.environ["OMP_NUM_THREADS"] = "8"
-os.environ["MKL_NUM_THREADS"] = "8"
-import pandas as pd
-import torch
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")   # threads here are for I/O, not math
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+import pandas as pd  # noqa: E402
+import torch  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))   # BreakingBadDataset, run_config
+from run_config import log_resolved, parse_with_config  # noqa: E402
+from BreakingBadDataset import DatasetConfig, _cache_path  # noqa: E402
+
+log = logging.getLogger(__name__)
+CACHE_KEYS = ("pos", "norm", "curv", "data", "pos_enc")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
 
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Validate per-config .pt cache files"
-    )
-    p.add_argument("--csv",              required=True)
-    p.add_argument("--root",             default=".")
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Validate per-config .pt cache files")
+    p.add_argument("--csv", nargs="+", required=True, help="One or more caption CSVs")
+    p.add_argument("--root", default=".")
 
-    # Config — must match values used in cache_dataset.py and training
+    # Geometry — same keys/defaults as train_mae.py / cache_dataset.py
     p.add_argument("--n_fps",            type=int,   default=512)
     p.add_argument("--disk_grid",        type=int,   default=16)
-    p.add_argument("--disk_channels",    type=int,   default=6)
-    p.add_argument("--disk_radius_frac", type=float, default=0.05)
-    p.add_argument("--disk_fill",        default="rbf",
-                   choices=["rbf", "nearest", "zero"])
-    p.add_argument("--curv_knn",         type=int,   default=10)
+    p.add_argument("--disk_radius_frac", type=float, default=0.07)
+    p.add_argument("--disk_fill",        default="rbf", choices=["rbf", "nearest", "zero"])
+    p.add_argument("--curv_knn",         type=int,   default=30)
     p.add_argument("--fourier_bands",    type=int,   default=0)
+    p.add_argument("--use_tangent_disk", action="store_false", default=True,
+                   help="PASSING this flag = point mode (disk_grid forced to 1)")
 
-    p.add_argument("--delete_bad",  action="store_true",
-                   help="Delete corrupt / wrong-shape files so they get rebuilt")
-    p.add_argument("--quiet",       action="store_true",
-                   help="Only print summary")
-    return p.parse_args()
+    p.add_argument("--check_mode", default="header", choices=["exists", "header", "full"])
+    p.add_argument("--check_workers", type=int, default=16,
+                   help="Parallel I/O threads (use fewer on a spinning disk / NFS)")
+    p.add_argument("--delete_bad", action="store_true",
+                   help="Delete corrupt / wrong-shape / non-finite files so they get rebuilt")
+    p.add_argument("--quiet", action="store_true", help="Only print summary")
+    return p
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Replicate _cache_path from BreakingBadDataset.py
-# ──────────────────────────────────────────────────────────────────────────────
-
-def cache_path(obj_path: Path, n_fps, disk_grid, disk_channels,
-               disk_radius_frac, disk_fill, curv_knn, fourier_bands) -> Path:
-    """
-    Mirrors _cache_path() in BreakingBadDataset.py exactly.
-    piece_0__n512_g16_c6_r050_rbf_k10_f0.pt
-    """
-    r   = int(round(disk_radius_frac * 1000))
-    tag = (
-        f"n{n_fps}"
-        f"_g{disk_grid}"
-        f"_c{disk_channels}"
-        f"_r{r:03d}"
-        f"_{disk_fill}"
-        f"_k{curv_knn}"
-        f"_f{fourier_bands}"
+def dataset_config(args) -> DatasetConfig:
+    """Exactly the DatasetConfig train_mae.py / infer_mae.py / cache_dataset.py build."""
+    return DatasetConfig(
+        n_fps=args.n_fps, disk_grid=args.disk_grid,
+        disk_radius_frac=args.disk_radius_frac, disk_channels=6,
+        disk_fill=args.disk_fill, curv_knn=args.curv_knn, cache_processed=True,
+        fourier_bands=args.fourier_bands, use_tangent_disk=args.use_tangent_disk,
     )
-    return obj_path.with_name(f"{obj_path.stem}__{tag}.pt")
+
+
+def expected_shapes(cfg: DatasetConfig) -> dict:
+    """Shapes process_mesh writes (always all 6 curvature channels)."""
+    pos_enc_dim = 6 + (2 * cfg.fourier_bands * 3 if cfg.fourier_bands > 0 else 0)
+    D = cfg.disk_grid if cfg.use_tangent_disk else 1
+    return {"pos": (cfg.n_fps, 3), "norm": (cfg.n_fps, 3), "curv": (cfg.n_fps, 6),
+            "data": (cfg.n_fps, 6, D, D), "pos_enc": (cfg.n_fps, pos_enc_dim)}
+
+
+def load_paths(csv_files: list[str], root: Path) -> list[Path]:
+    """Same row filtering as BreakingBadDataset (parse_error rows, last row)."""
+    paths = set()
+    for csv in csv_files:
+        df = pd.read_csv(csv, dtype=str, usecols=lambda c: c.strip() in ("path", "parse_error"))
+        df.columns = df.columns.str.strip()
+        if "parse_error" in df.columns:
+            df = df[df["parse_error"].str.upper().str.strip() != "TRUE"]
+        df = df[:-1]   # mirrors BreakingBadDataset's df[:-1]
+        paths |= {root / p.strip() for p in df["path"]}
+        log.info(f"{csv}: {df['path'].nunique()} meshes")
+    return sorted(paths)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Expected tensor shapes
+# Per-file check
 # ──────────────────────────────────────────────────────────────────────────────
 
-def expected_shapes(n_fps, disk_grid, disk_channels, fourier_bands) -> dict:
-    pos_enc_dim = 6 + (2 * fourier_bands * 3 if fourier_bands > 0 else 0)
-    return {
-        "pos"    : (n_fps, 3),
-        "norm"   : (n_fps, 3),
-        "curv"   : (n_fps, 6),                              # always all 6 curvature features
-        "data"   : (n_fps, disk_channels, disk_grid, disk_grid),
-        "pos_enc": (n_fps, pos_enc_dim),
-    }
+def _load(pt: Path, mode: str):
+    if mode == "header":
+        try:   # torch >= 2.1, zipfile format: tensor data is NOT read
+            return torch.load(pt, map_location="cpu", weights_only=False, mmap=True)
+        except Exception:
+            pass   # old torch / legacy format — a full load decides if it's corrupt
+    return torch.load(pt, map_location="cpu", weights_only=False)
 
 
-def check_shapes(cache: dict, expected: dict) -> list[str]:
-    out = []
-    for key, exp in expected.items():
+def check_one(obj: Path, cfg: DatasetConfig, exp: dict, mode: str):
+    """→ (obj, status, detail, pt). status: ok | missing | corrupt | wrong_shape | nonfinite"""
+    pt = _cache_path(obj, cfg)
+    if not pt.is_file():
+        return obj, "missing", f"expected {pt.name}", pt
+    if mode == "exists":
+        return obj, "ok", "", pt
+    try:
+        cache = _load(pt, mode)
+        if not isinstance(cache, dict):
+            raise TypeError(f"not a dict ({type(cache).__name__})")
+    except Exception as e:
+        return obj, "corrupt", str(e)[:100], pt
+
+    problems = []
+    for key, shape in exp.items():
         if key not in cache:
-            out.append(f"missing key '{key}'")
-            continue
-        got = tuple(cache[key].shape)
-        if got != exp:
-            out.append(f"{key}={got} expected {exp}")
-    return out
+            problems.append(f"missing key '{key}'")
+        elif tuple(cache[key].shape) != shape:
+            problems.append(f"{key}={tuple(cache[key].shape)} expected {shape}")
+    if problems:
+        return obj, "wrong_shape", "; ".join(problems), pt
+
+    if mode == "full":
+        bad = [k for k in CACHE_KEYS if not torch.isfinite(cache[k]).all()]
+        if bad:
+            return obj, "nonfinite", f"NaN/Inf in {bad}", pt
+    return obj, "ok", "", pt
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    args = parse_with_config(build_parser(), "check_cache", argv)
+    log_resolved(args, ["csv", "root", "n_fps", "use_tangent_disk", "disk_grid",
+                        "disk_radius_frac", "disk_fill", "curv_knn", "fourier_bands",
+                        "check_mode", "check_workers", "delete_bad"])
 
-    # ── Load CSV ──────────────────────────────────────────────────────────────
-    df = pd.read_csv(args.csv, dtype=str)
-    df.columns = df.columns.str.strip()
-    if "parse_error" in df.columns:
-        df = df[df["parse_error"].str.upper().str.strip() != "TRUE"]
-    df = df[:-1]
-
-    root  = Path(args.root)
-    paths = sorted({(root / r["path"].strip()) for _, r in df.iterrows()})
+    cfg = dataset_config(args)
+    exp = expected_shapes(cfg)
+    paths = load_paths(args.csv, Path(args.root))
     total = len(paths)
+    log.info(f"Cache filename pattern: {_cache_path(Path('piece_0.obj'), cfg).name}")
+    log.info("Expected shapes: " + "  ".join(f"{k}={s}" for k, s in exp.items()))
 
-    # ── Build expected cache name for one example ─────────────────────────────
-    example_pt = cache_path(
-        Path("piece_0.obj"),
-        args.n_fps, args.disk_grid, args.disk_channels,
-        args.disk_radius_frac, args.disk_fill,
-        args.curv_knn, args.fourier_bands,
-    )
-    exp_shapes = expected_shapes(
-        args.n_fps, args.disk_grid, args.disk_channels, args.fourier_bands
-    )
+    counts = dict(ok=0, missing=0, corrupt=0, wrong_shape=0, nonfinite=0)
+    bad, lock = [], threading.Lock()
+    t0 = last = time.time()
 
-    # ── Print config header ───────────────────────────────────────────────────
-    print(f"\nConfig")
-    print(f"{'─'*56}")
-    print(f"  n_fps          : {args.n_fps}")
-    print(f"  disk_grid      : {args.disk_grid}")
-    print(f"  disk_channels  : {args.disk_channels}")
-    print(f"  disk_radius_frac: {args.disk_radius_frac}")
-    print(f"  disk_fill      : {args.disk_fill}")
-    print(f"  curv_knn       : {args.curv_knn}")
-    print(f"  fourier_bands  : {args.fourier_bands}")
-    print(f"\nCache filename pattern:")
-    print(f"  {example_pt.name}")
-    print(f"\nExpected tensor shapes:")
-    for k, s in exp_shapes.items():
-        print(f"  {k:<10}: {s}")
-    print(f"{'─'*56}\n")
+    def record(res):
+        nonlocal last
+        obj, status, detail, pt = res
+        with lock:
+            counts[status] += 1
+            if status != "ok":
+                bad.append((str(obj), status, detail))
+                if args.delete_bad and status != "missing":
+                    pt.unlink(missing_ok=True)
+            done = sum(counts.values())
+            now = time.time()
+            if not args.quiet and (now - last > 1.0 or done == total):
+                last = now
+                rate = done / max(now - t0, 1e-6)
+                print(f"\r[{done}/{total}]  " + "  ".join(f"{k}={v}" for k, v in counts.items())
+                      + f"  {rate:.0f} files/s   ", end="", flush=True)
 
-    # ── Validate ──────────────────────────────────────────────────────────────
-    ok = missing = corrupt = wrong_shape = 0
-    bad = []   # (obj_str, reason, pt_path)
-
-    for i, obj in enumerate(paths, 1):
-        pt = cache_path(
-            obj,
-            args.n_fps, args.disk_grid, args.disk_channels,
-            args.disk_radius_frac, args.disk_fill,
-            args.curv_knn, args.fourier_bands,
-        )
-
-        print(
-            f"\r[{i}/{total}]  "
-            f"ok={ok}  missing={missing}  "
-            f"corrupt={corrupt}  wrong_shape={wrong_shape}   ",
-            end="", flush=True,
-        )
-
-        # 1. Existence
-        if not pt.exists():
-            missing += 1
-            bad.append((str(obj), f"missing  (expected: {pt.name})", pt))
-            continue
-
-        # 2. Loadability
-        try:
-            cache = torch.load(pt, weights_only=False, map_location="cpu")
-        except Exception as e:
-            corrupt += 1
-            bad.append((str(obj), f"corrupt: {str(e)[:80]}", pt))
-            if args.delete_bad:
-                pt.unlink(missing_ok=True)
-            continue
-
-        if not isinstance(cache, dict):
-            corrupt += 1
-            bad.append((str(obj), f"corrupt: not a dict ({type(cache).__name__})", pt))
-            if args.delete_bad:
-                pt.unlink(missing_ok=True)
-            continue
-
-        # 3. Shape check
-        mismatches = check_shapes(cache, exp_shapes)
-        if mismatches:
-            wrong_shape += 1
-            bad.append((str(obj), "wrong shape: " + "; ".join(mismatches), pt))
-            if args.delete_bad:
-                pt.unlink(missing_ok=True)
-            continue
-
-        ok += 1
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    print(f"\r{'─'*56}")
-    print(f"Total        : {total}")
-    print(f"OK           : {ok}  ({ok/total*100:.1f}%)")
-    print(f"Missing      : {missing}")
-    print(f"Corrupt      : {corrupt}")
-    print(f"Wrong shape  : {wrong_shape}"
-          + ("  ← shapes inside file don't match config" if wrong_shape else ""))
-    print(f"{'─'*56}")
-
-    if bad and not args.quiet:
-        print(f"\nBad files ({len(bad)}):")
-        for obj_path, reason, _ in bad[:30]:
-            print(f"  {Path(obj_path).name:<42}  {reason}")
-        if len(bad) > 30:
-            print(f"  ... and {len(bad)-30} more")
-
-    if bad:
-        out = Path("bad_cache.txt")
-        out.write_text("\n".join(f"{p}\t{r}" for p, r, _ in bad))
-        print(f"\nFull list → {out}")
-
-        if args.delete_bad:
-            print("Bad .pt files deleted — rebuild with:")
-        else:
-            print("\nTo delete bad files and rebuild:")
-            print("  python check_cache.py [same args] --delete_bad")
-            print("\nRebuild command:")
-
-        print(
-            f"  python cache_dataset.py --csv {args.csv} --root {args.root} --force \\\n"
-            f"      --n_fps {args.n_fps} --disk_grid {args.disk_grid} "
-            f"--curv_channels {args.disk_channels} \\\n"
-            f"      --disk_radius_frac {args.disk_radius_frac} "
-            f"--disk_fill {args.disk_fill} \\\n"
-            f"      --curv_knn {args.curv_knn} --fourier_bands {args.fourier_bands}"
-        )
-        sys.exit(1)
+    workers = max(1, args.check_workers)
+    if workers == 1:
+        for obj in paths:
+            record(check_one(obj, cfg, exp, args.check_mode))
     else:
-        print("\nAll caches valid ✓")
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for res in pool.map(lambda o: check_one(o, cfg, exp, args.check_mode), paths,
+                                chunksize=1):
+                record(res)
+
+    elapsed = time.time() - t0
+    print()
+    print("─" * 56)
+    print(f"Mode         : {args.check_mode}   ({workers} threads, {elapsed:.1f}s, "
+          f"{total / max(elapsed, 1e-6):.0f} files/s)")
+    print(f"Total        : {total}")
+    for k, v in counts.items():
+        print(f"{k:<13}: {v}" + (f"  ({v / max(total, 1) * 100:.1f}%)" if k == "ok" else ""))
+    print("─" * 56)
+
+    if not bad:
+        print("All caches valid ✓")
         sys.exit(0)
+
+    bad.sort()
+    if not args.quiet:
+        print(f"\nBad files ({len(bad)}):")
+        for obj_path, status, detail in bad[:30]:
+            print(f"  {Path(obj_path).parent.parent.name}/{Path(obj_path).name:<16} "
+                  f"{status:<12} {detail}")
+        if len(bad) > 30:
+            print(f"  ... and {len(bad) - 30} more")
+    out = Path("bad_cache.txt")
+    out.write_text("".join(f"{p}\t{s}\t{d}\n" for p, s, d in bad))
+    print(f"\nFull list → {out}")
+    if args.delete_bad:
+        print("Bad files deleted (missing ones untouched). Rebuild with:")
+    else:
+        print("Delete corrupt/wrong-shape files with --delete_bad, then rebuild with:")
+    print("  python tools/cache_data/cache_dataset.py --config <same yml>")
+    sys.exit(1)
 
 
 if __name__ == "__main__":

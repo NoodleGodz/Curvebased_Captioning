@@ -1,0 +1,80 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Caption evaluation config — separate from the run configs so one file can
+# compare many runs (the ablation table).
+#
+#   evaluation/caption_evaluation.ipynb  →  CONFIG = "configs/eval.yml"
+#   python evaluation/eval_captions.py --config configs/eval.yml
+#   python evaluation/eval_captions.py --config configs/eval.yml --only curvature_disk --only point_only
+#   python evaluation/eval_captions.py --config configs/eval.yml --pred quick_test=outputs/preds_tmp.csv
+# Run from the repo root; relative paths are relative to it.
+#
+# To add an ablation: run infer_mae.py for it, then add ONE entry under
+# `predictions:` pointing at its CSV. Each entry becomes one row of every table.
+# Unknown keys are an error (typos don't get silently ignored).
+# ──────────────────────────────────────────────────────────────────────────────
+name: ablation_v3                  # used for the default output folder
+output_dir: outputs/eval_ablation_v3
+run_config: configs/mae_v3.yml     # optional: fills references.true_csv / image_root
+                                   # from data.test_csv / data.root when left out
+
+# ── Human-verified references (shared by every prediction set) ─────────────
+references:
+  true_csv: data/captions/caption_breakingbad_test_new.csv   # ≥ 2 captions per object (caption_idx 0, 1)
+  images_csv: data/captions/captions.csv       # supplies images_used if true_csv lacks it
+  # image_root: /path/to/breaking_bad          # default: run_config's data.root
+  class_col_true: class
+  class_regex: everyday/([^/]+)/               # fallback: class from the OBJ path
+
+# ── Prediction sets: one entry per run / ablation ───────────────────────────
+#   <name>:                 file-safe id (used in output file names)
+#     csv:                  predictions CSV from infer_mae.py           (required)
+#     label:                text shown in tables / LaTeX                (default: name)
+#     run_config:           run YAML that produced it → provenance table (n_fps, disk_grid, ...)
+#     human_scores:         scored CSV from caption_evaluator.ipynb     (optional)
+#     enabled: false        keep the entry but leave it out of this evaluation
+#     notes:                free text, copied into variants.csv
+# A bare `<name>: <csv>` also works. Order here = row order in the tables.
+predictions:
+  curvature_disk:
+    csv: outputs/predictions_mae_v3.csv
+    label: Curvature disk (ours)
+    run_config: configs/mae_v3.yml
+    # human_scores: outputs/predictions_mae_v3_scored.csv
+
+  point_only:
+    csv: outputs/predictions_point_only.csv
+    label: Point-only
+    # run_config: configs/mae_point_only.yml   # mae_v3.yml with geometry.use_tangent_disk: false
+    enabled: false                       # flip to true once the CSV exists
+
+  image_only:
+    csv: outputs/predictions_image_only.csv    # legacy/infer_mae_image_only.py
+    label: Image-only
+    notes: rendered fracture view instead of geometry tokens
+    enabled: false
+
+  # v2_best: outputs/predictions_test_set_v2_best.csv     # bare form
+
+# ── Metric settings (same keys as before; defaults shown) ───────────────────
+metrics:
+  primary_pred: 0          # caption_idx used for collapse + CIDEr-R tables.
+                           # The submitted tables used caption_pred_1 → set 1 to reproduce them.
+  class_col_pred: true_class
+  clip_model: openai/clip-vit-large-patch14
+  clip_w: 2.5              # Hessel CLIP-S weight inside RefCLIP
+  clipscore_report: cos100 # cos100 = 100·cos (paper's 23.x numbers) | hessel = 100·2.5·cos
+  r_precision_k: [1, 5]
+  r_precision_ties: expected  # expected = ties at random-tie-break value | index = old topk order
+  near_dup_threshold: 0.95 # CLIP text cosine counted as near-duplicate
+  distinct_n: 2
+  cider_n_max: 4
+  cider_sigma: 6.0
+  cider_baseline: symmetric  # symmetric = both ref directions | legacy = ref0 vs ref1 only
+  n_bootstrap: 10000
+  bootstrap_seed: 42
+  alpha: 0.05
+  embed_cache: true        # cache CLIP embeddings in <output_dir>/.clip_cache
+  device: auto
+  img_batch_size: 32
+  txt_batch_size: 64
+  n_examples: 3            # qualitative worst-RefCLIP examples per set

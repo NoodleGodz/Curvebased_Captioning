@@ -18,7 +18,7 @@ open3d
 trimesh
 pyrender
 
-# Config files (for the optional --config loader)
+# Config files (configs/*.yml, read by every pipeline script)
 pyyaml
 
 # Logging (optional)
@@ -27,6 +27,13 @@ wandb
 # Notebooks (evaluation/ and tools/verify_captions/)
 jupyter
 matplotlib
+
+# Optional: thread caps in parallel caching, progress bars
+threadpoolctl
+tqdm
+
+# Tests (python -m pytest -q tests)
+pytest
 
 # Optional, faster LLM attention (needs a CUDA toolchain):
 #   pip install flash-attn --no-build-isolation
