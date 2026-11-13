@@ -3,3 +3,4 @@ data/renders/
 *.pt
 __pycache__/
 wandb/
+*.patch
